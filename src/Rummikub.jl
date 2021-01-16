@@ -76,7 +76,7 @@ function index_per_suit(runs::Array{Bool, 2}, value::Int, S)
   #    index:  1   2   3   4   5   6
   # where the number of possibilities (6) equals third_dimension(2)
   N, M = size(runs)
-  lengths = zeros(Int, M)
+  lengths = zeros(Int8, M)
   for deck = 1 : M
     if runs[value, deck]
       lengths[deck] = 2
@@ -95,10 +95,11 @@ function index_per_suit(runs::Array{Bool, 2}, value::Int, S)
     end
   end
 
-  sort!(lengths)
   if M == 1
     return lengths[1]
   elseif M == 2
+    if lengths[2] < lengths[1] reverse!(lengths) end
+
     if lengths[1] == 0
       return lengths[2]
     elseif lengths[1] == 1
@@ -107,6 +108,7 @@ function index_per_suit(runs::Array{Bool, 2}, value::Int, S)
       return 6
     end
   else
+    sort!(lengths)
     # TODO general case
   end
 end
@@ -116,6 +118,7 @@ end
 function extend_runs!(state::GameState{N, K, M, S}, extension::Vector{RunExtension}, value::Int) where {N, K, M, S}
   for e ∈ extension
     state.runs[value,e.deck,e.suit] = true
+    # We store where the tile is taken from such that it can correctly be undone
     e.from_table = state.table[value,e.suit] > 0
     if e.from_table
       # We prefer taking from the table
@@ -155,9 +158,9 @@ function max_score_increment(memory::ScoreMemory{N, K, M}, state::GameState{N, K
     # using the remaining available tiles
     group_size = sum_of_valid_group_sizes(state, value)
 
-    # The group size == -Inf if the resulting groups can not use all the
+    # The group size == -1 if the resulting groups can not use all the
     # available tiles of the current value that are on the table
-    if group_size > -Inf
+    if group_size ≥ 0
       new_score = value * group_size + score_increment(state, value) + max_score_increment(state, value + 1)
       if new_score > memory.score[I]
         memory.score[I] = new_score
@@ -208,13 +211,21 @@ function sum_of_valid_group_sizes(state::GameState{N, K, M, S}, value::Int) wher
     # Impossible to make valid group(s)
     return -1
   elseif nr_available < 2S
-    # At most 1 group can be made. This is valid only if all tiles on the table are used
-    # in this group and if there are at least S different suits available
-    return nr_table ≤ S && all(nr_table_per_suit ≤ 1) && count(nr_available_per_suit > 0) ≥ S ? S : -1
+    if nr_table == 0
+      # At most one group can be made
+      return count(nr_available_per_suit > 0) ≥ S ? S : 0
+    else
+      # One group must be made. This is valid only if all tiles on the table are used
+      # in this group and if there are at least S different suits available
+      return nr_table ≤ S && all(nr_table_per_suit ≤ 1) && count(nr_available_per_suit > 0) ≥ S ? S : -1
+    end
   end
 
-  
+  # Simple lower and upper bounds on the nr. of groups
+  min_nr_groups = ceil(Int, nr_table / K)
+  max_nr_groups = floor(Int, nr_available / S)
 
+  # TODO nontrivial cases
 end
 
 # Iterate over all possible valid extensions of the runs using the available tiles
