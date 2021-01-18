@@ -7,6 +7,8 @@
 #   (https://arxiv.org/abs/1604.07553)
 module Rummikub
 
+using SparseArrays
+
 # N values
 # K suits
 # M decks
@@ -38,6 +40,11 @@ struct RunExtension
   from_table::Bool
 end
 
+@enum ScoreState begin
+    uninitialized = -2
+    invalid = -1
+end
+
 # struct ScoreMemory{N,K,M}
 #   score::Array{Int, 3}
 #   max_index::Array{Int, 3}
@@ -46,13 +53,17 @@ end
 # ScoreMemory(N::Int, K::Int, M::Int) = ScoreMemory{N, K, M}(zeros(Int, N, K, third_dimension(M)), zeros(Bool, N, K, third_dimension(M)))
 
 # TODO The paper suggests a state space of size N x K x f(M) rather than N x f(M)^K, how?
-struct ScoreMemory{N,K,M}
+# TODO for given N, K, M, S we can precompute and store the ScoreMemory
+struct ScoreMemory{N,K,M,S}
   # Stores the maximum score increment (N x f(M)^K)
-  score::Array{Int}
+  score_increment::Array{Int}
   max_index::Array{Int}
+
+  # Sum of group sizes (K^M x K^M, but sparse (or with complicated indexing))
+  sum_of_group_sizes::SparseArray{Int}
 end
 
-ScoreMemory(N::Int, K::Int, M::Int) = ScoreMemory{N, K, M}(zeros(Int, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)), zeros(Bool, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)))
+ScoreMemory(N::Int, K::Int, M::Int, S::Int) = ScoreMemory{N, K, M, S}(zeros(Int, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)), zeros(Bool, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)))
 
 # With 'third dimension' we refer to the third dimension of the score memory arrays
 Base.@pure third_dimension(M::Int) = Int((M + 1) * (M + 2) /2)
@@ -141,13 +152,11 @@ end
 
 # The maximum score increment that can be achieved by adding all tiles ≥ value
 # that are available (i.e. the MaxScore function of Van Rijn et. al.)
-function max_score_increment(memory::ScoreMemory{N, K, M}, state::GameState{N, K, M, S}, value::Int) where {N, K, M, S}
+function max_score_increment!(memory::ScoreMemory{N, K, M, S}, state::GameState{N, K, M, S}, value::Int) where {N, K, M, S}
   if value > N return 0 end
   I = index(state, value)
   # Skip if score score increment has already been computed
-  if memory.score[I] > -Inf
-    return memory.score[I] == -1 ? -Inf memory.score[I]
-  end
+  if memory.score_increment[I] != uninitialized return memory.score_increment[I]
 
   # Consider all possible run extensions of the current state, using the
   # available tiles of the current value
@@ -156,22 +165,25 @@ function max_score_increment(memory::ScoreMemory{N, K, M}, state::GameState{N, K
 
     # For each such extension, consider the maximum groups that can be formed
     # using the remaining available tiles
-    group_size = sum_of_valid_group_sizes(state, value)
+    group_size = sum_of_valid_group_sizes!(memory, state, value)
 
     # The group size == -1 if the resulting groups can not use all the
     # available tiles of the current value that are on the table
-    if group_size ≥ 0
-      new_score = value * group_size + score_increment(state, value) + max_score_increment(state, value + 1)
-      if new_score > memory.score[I]
-        memory.score[I] = new_score
-        memory.max_index[I] = index(state, value)
+    if group_size != invalid
+      recurse_increment = max_score_increment!(state, value + 1)
+      if recurse_increment != invalid
+        new_score = value * group_size + score_increment(state, value) + recurse_increment
+        if new_score > memory.score_increment[I]
+          memory.score_increment[I] = new_score
+          memory.max_index[I] = index(state, value)
+        end
       end
     end
     undo_extend_runs!(state, extension, value)
   end
 
   # The score is invalidated if no valid extensions were considered
-  memory.score[I] = max(memory.score[I], -1)
+  memory.score_increment[I] = max(memory.score_increment[I], Int(invalid))
 end
 
 # The increment in score achieved by the use of value in state
@@ -197,35 +209,33 @@ end
 # returns the sum of the group sizes
 # A valid group is one which has length at least S, each of a different suit
 # Moreover, the groups as a whole are valid if all table tiles of value are used
-function sum_of_valid_group_sizes(state::GameState{N, K, M, S}, value::Int) where {N, K, M, S}
-  nr_available_per_suit = view(state.available, value, :)
-  nr_table_per_suit = view(state.table, value, :)
+function sum_of_valid_group_sizes!(memory::ScoreMemory{N, K, M, S}, state::GameState{N, K, M, S}, value::Int) where {N, K, M, S}
+  available = view(state.available, value, :)
+  on_table = view(state.table, value, :)
 
-  nr_available = sum(nr_available_per_suit)
-  nr_table = sum(nr_table_per_suit)
+  nr_available = sum(available)
+  nr_on_table = sum(on_table)
 
   # Trivial cases
-  if nr_available == 0
-    return 0
-  elseif nr_available < S
+  if nr_available < S || count(available > 0) < S
     # Impossible to make valid group(s)
-    return -1
+    return nr_on_table == 0 ? 0 : invalid
   elseif nr_available < 2S
-    if nr_table == 0
+    if nr_on_table == 0
       # At most one group can be made
-      return count(nr_available_per_suit > 0) ≥ S ? S : 0
+      return count(available > 0) ≥ S ? S : 0
     else
       # One group must be made. This is valid only if all tiles on the table are used
       # in this group and if there are at least S different suits available
-      return nr_table ≤ S && all(nr_table_per_suit ≤ 1) && count(nr_available_per_suit > 0) ≥ S ? S : -1
+      return nr_on_table ≤ S && all(on_table ≤ 1) && count(available > 0) ≥ S ? S : invalid
     end
   end
 
-  # Simple lower and upper bounds on the nr. of groups
-  min_nr_groups = ceil(Int, nr_table / K)
-  max_nr_groups = floor(Int, nr_available / S)
-
   # TODO nontrivial cases
+  # TODO store, in memory, the mapping sort!((available, on_table)) -> sum_of_valid_group_sizes
+  perm = sortperm(available)
+  available = available[perm]
+  on_table = on_table[perm]
 end
 
 # Iterate over all possible valid extensions of the runs using the available tiles
@@ -240,7 +250,7 @@ end
 
 # Given the maximum score increments, reconstruct which runs result in
 # this score (groups trivially follow from state.available)
-function reconstruct_optimal_runs!(state::GameState{N, K, M, S}, memory::ScoreMemory{N,K,M}) where {N, K, M, S}
+function reconstruct_optimal_runs!(state::GameState{N, K, M, S}, memory::ScoreMemory{N, K, M, S}) where {N, K, M, S}
   value = 0
   I = index(state, value)
   while value ≤ N
