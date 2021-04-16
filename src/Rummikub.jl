@@ -7,8 +7,6 @@
 #   (https://arxiv.org/abs/1604.07553)
 module Rummikub
 
-using SparseArrays
-
 # N values
 # K suits
 # M decks
@@ -44,6 +42,10 @@ end
     uninitialized = -2
     invalid = -1
 end
+is_initialized(val::ScoreState) = val != uninitialized
+is_initialized(val::Int) = val != Int(uninitialized)
+is_valid(val::ScoreState) = val != invalid
+is_valid(val::Int) = val != Int(invalid)
 
 # struct ScoreMemory{N,K,M}
 #   score::Array{Int, 3}
@@ -53,17 +55,16 @@ end
 # ScoreMemory(N::Int, K::Int, M::Int) = ScoreMemory{N, K, M}(zeros(Int, N, K, third_dimension(M)), zeros(Bool, N, K, third_dimension(M)))
 
 # TODO The paper suggests a state space of size N x K x f(M) rather than N x f(M)^K, how?
-# TODO for given N, K, M, S we can precompute and store the ScoreMemory
 struct ScoreMemory{N,K,M,S}
   # Stores the maximum score increment (N x f(M)^K)
   score_increment::Array{Int}
   max_index::Array{Int}
 
-  # Sum of group sizes (K^M x K^M, but sparse (or with complicated indexing))
-  sum_of_group_sizes::SparseArray{Int}
+  # Sum of group sizes (M^K x M^K, but sparse (or with complicated indexing))
+  sum_of_group_sizes::Array{Int}
 end
 
-ScoreMemory(N::Int, K::Int, M::Int, S::Int) = ScoreMemory{N, K, M, S}(zeros(Int, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)), zeros(Bool, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)))
+ScoreMemory(N::Int, K::Int, M::Int, S::Int) = ScoreMemory{N, K, M, S}(fill!(zeros(Int, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)), Int(uninitialized)), zeros(Int, ntuple(i -> i == 1 ? N : third_dimension(M), 1+K)), fill!(zeros(Int, ntuple(i -> M, 2K)), Int(uninitialized)))
 
 # With 'third dimension' we refer to the third dimension of the score memory arrays
 Base.@pure third_dimension(M::Int) = Int((M + 1) * (M + 2) /2)
@@ -156,7 +157,7 @@ function max_score_increment!(memory::ScoreMemory{N, K, M, S}, state::GameState{
   if value > N return 0 end
   I = index(state, value)
   # Skip if score score increment has already been computed
-  if memory.score_increment[I] != uninitialized return memory.score_increment[I]
+  if is_initialized(memory.score_increment[I]) return memory.score_increment[I]
 
   # Consider all possible run extensions of the current state, using the
   # available tiles of the current value
@@ -169,9 +170,9 @@ function max_score_increment!(memory::ScoreMemory{N, K, M, S}, state::GameState{
 
     # The group size == -1 if the resulting groups can not use all the
     # available tiles of the current value that are on the table
-    if group_size != invalid
+    if is_valid(group_size)
       recurse_increment = max_score_increment!(state, value + 1)
-      if recurse_increment != invalid
+      if is_valid(recurse_increment)
         new_score = value * group_size + score_increment(state, value) + recurse_increment
         if new_score > memory.score_increment[I]
           memory.score_increment[I] = new_score
@@ -192,10 +193,10 @@ function score_increment(state::GameState{N, K, M, S}, value::Int)  where {N, K,
   for suit = 1 : K
     for deck = 1 : M
       if state.runs[value,deck,suit]
-        if value > S && all(state.runs[value-S:value,deck,suit])
+        if value > S && all(view(state.runs, value-S:value ,deck, suit))
           # Run was already valid
           ans += value
-        elseif value > S - 1 && all(state.runs[value-S+1:value,deck,suit])
+        elseif value > S - 1 && all(view(state.runs, value-S+1:value, deck, suit))
           # Run becomes valid, so the increment is
           #   value - S + 1, value - S + 2, ..., value
           ans += Int(S * (value - (S - 1)/2))
@@ -219,7 +220,7 @@ function sum_of_valid_group_sizes!(memory::ScoreMemory{N, K, M, S}, state::GameS
   # Trivial cases
   if nr_available < S || count(available > 0) < S
     # Impossible to make valid group(s)
-    return nr_on_table == 0 ? 0 : invalid
+    return nr_on_table == 0 ? 0 : Int(invalid)
   elseif nr_available < 2S
     if nr_on_table == 0
       # At most one group can be made
@@ -227,15 +228,36 @@ function sum_of_valid_group_sizes!(memory::ScoreMemory{N, K, M, S}, state::GameS
     else
       # One group must be made. This is valid only if all tiles on the table are used
       # in this group and if there are at least S different suits available
-      return nr_on_table ≤ S && all(on_table ≤ 1) && count(available > 0) ≥ S ? S : invalid
+      return nr_on_table ≤ S && all(on_table ≤ 1) && count(available > 0) ≥ S ? S : Int(invalid)
     end
   end
 
-  # TODO nontrivial cases
-  # TODO store, in memory, the mapping sort!((available, on_table)) -> sum_of_valid_group_sizes
   perm = sortperm(available)
   available = available[perm]
   on_table = on_table[perm]
+  I = CartesianIndex(available..., on_table...)
+  if is_initialized(memory.sum_of_group_sizes[I]) return memory.sum_of_group_sizes[I]
+
+
+  # TODO nontrivial cases
+  group_sizes = 0
+  # For each deck (M decks) we either have a group of length S, S+1, ..., K-1 or K
+  # (considering l seperate groups of size S if M ≥ l × S is pointless since only the
+  # number of used tiles is considered)
+
+
+  memory.sum_of_group_sizes[I] = group_sizes
+end
+
+# Given the nr tiles per suit (available tiles) and the desired nr of tiles per deck
+# (group size per deck), return whether or not this is possible
+# TODO we also want to know if it is possible to satisfy the table constraint
+function groups_are_possible(available_per_suit::Vector{Int}, tiles_per_deck::Vector{Int})
+  if sum(available_per_suit) < sum(tiles_per_deck) return false
+
+  K = size(available_per_suit, 1)
+  M = size(tiles_per_deck, 1)
+
 end
 
 # Iterate over all possible valid extensions of the runs using the available tiles
